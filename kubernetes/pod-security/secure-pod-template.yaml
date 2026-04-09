@@ -1,0 +1,116 @@
+# Secure Pod Template — zero-credentials pattern
+# Secrets consumed via volume mount, NOT environment variables
+# This template is the reference for all production workloads
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-api
+  namespace: backend
+  labels:
+    app: backend-api
+    secrets-pattern: volume-mount   # OPA checks for this label
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: backend-api
+  template:
+    metadata:
+      labels:
+        app: backend-api
+        secrets-pattern: volume-mount
+      annotations:
+        # Prevent AWS credentials from being injected via IMDS by node
+        eks.amazonaws.com/compute-type: ec2
+    spec:
+      serviceAccountName: backend-api-sa   # IRSA-annotated SA
+
+      # Security context — hardened
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+
+      automountServiceAccountToken: true   # Required for IRSA
+
+      containers:
+        - name: backend-api
+          image: "ECR_REGISTRY/backend-api:IMAGE_TAG"
+          imagePullPolicy: Always
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          ports:
+            - containerPort: 8080
+              name: http
+
+          # ✅ CORRECT: secrets via volume mount — files, not env vars
+          volumeMounts:
+            - name: db-credentials
+              mountPath: /run/secrets/db
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+
+          # ✅ Non-sensitive env vars only (no secrets here)
+          env:
+            - name: PORT
+              value: "8080"
+            - name: LOG_LEVEL
+              value: "info"
+            - name: ENV
+              value: "prod"
+            - name: DB_CREDENTIALS_PATH
+              value: "/run/secrets/db"
+
+          # ❌ WRONG pattern — never do this (OPA will reject):
+          # envFrom:
+          #   - secretRef:
+          #       name: backend-db-credentials
+
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+
+      volumes:
+        # Secret mounted as tmpfs (in-memory, not on disk)
+        - name: db-credentials
+          secret:
+            secretName: backend-db-credentials
+            defaultMode: 0400    # Read-only by owner only
+            items:
+              - key: DATABASE_URL
+                path: database_url
+              - key: DB_HOST
+                path: db_host
+              - key: DB_PASSWORD
+                path: db_password
+        - name: tmp
+          emptyDir:
+            medium: Memory   # tmpfs — not written to disk
+            sizeLimit: 64Mi

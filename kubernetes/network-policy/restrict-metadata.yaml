@@ -1,0 +1,75 @@
+# Network Policy — restrict access to AWS Instance Metadata Service (IMDS)
+# Only pods that need IRSA token refresh can reach 169.254.169.254
+# All other pods are blocked — prevents credential theft via SSRF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: block-metadata-endpoint
+  namespace: backend
+  annotations:
+    description: "Block IMDS access — only IRSA-annotated SAs get creds via projected volumes"
+spec:
+  podSelector:
+    matchLabels:
+      block-imds: "true"    # Apply to pods with this label
+  policyTypes:
+    - Egress
+  egress:
+    # Allow everything EXCEPT the IMDS endpoint
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.169.254/32   # IMDS endpoint
+              - 169.254.0.0/16       # Link-local (broader block)
+---
+# Allow external-secrets-operator to reach Secrets Manager
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-external-secrets-egress
+  namespace: external-secrets
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: external-secrets
+  policyTypes:
+    - Egress
+  egress:
+    # Allow HTTPS to AWS Secrets Manager endpoint
+    - ports:
+        - port: 443
+          protocol: TCP
+    # Allow DNS
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+---
+# Default deny-all for secrets namespaces
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: backend
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  egress:
+    # Allow DNS resolution
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Allow internal cluster traffic
+    - to:
+        - ipBlock:
+            cidr: 10.0.0.0/8
+    # Allow HTTPS to AWS APIs
+    - ports:
+        - port: 443
+          protocol: TCP

@@ -1,0 +1,27 @@
+# Rotation schedule configuration
+# Applied per secret in the Terraform secrets-manager module
+
+rotation_schedules:
+  # Database passwords — monthly
+  database:
+    automatically_after_days: 30
+    schedule_expression: "rate(30 days)"
+    duration: "2h"
+
+  # JWT signing keys — quarterly (must coordinate with key consumers)
+  jwt_signing:
+    automatically_after_days: 90
+    schedule_expression: "rate(90 days)"
+    duration: "4h"
+
+  # API keys — every 6 months
+  api_keys:
+    automatically_after_days: 180
+    schedule_expression: "rate(180 days)"
+    duration: "2h"
+
+  # Internal service tokens — weekly
+  service_tokens:
+    automatically_after_days: 7
+    schedule_expression: "rate(7 days)"
+    duration: "1h"

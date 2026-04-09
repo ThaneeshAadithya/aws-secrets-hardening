@@ -1,0 +1,137 @@
+name: Security Checks
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write
+  pull-requests: write
+
+jobs:
+  opa-checks:
+    name: OPA Zero-Credentials Policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OPA
+        run: |
+          curl -L -o opa https://openpolicyagent.org/downloads/latest/opa_linux_amd64_static
+          chmod +x opa && sudo mv opa /usr/local/bin/
+
+      - name: Run OPA unit tests
+        run: opa test opa/policies/ opa/tests/ -v
+
+      - name: Check Kubernetes manifests
+        run: ./scripts/opa-check.sh
+
+  credential-audit:
+    name: Credential Audit (TruffleHog)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: TruffleHog scan
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --only-verified
+
+  terraform-plan:
+    name: Terraform Plan + IAM OPA
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        env: [dev, prod]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: "~1.7" }
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Terraform Init
+        working-directory: terraform/environments/${{ matrix.env }}
+        run: terraform init -backend-config=backend.hcl
+
+      - name: Terraform Plan
+        working-directory: terraform/environments/${{ matrix.env }}
+        run: terraform plan -no-color -out=tfplan.binary
+        env:
+          TF_VAR_aws_org_id:        ${{ secrets.AWS_ORG_ID }}
+          TF_VAR_oidc_provider_arn: ${{ secrets.OIDC_PROVIDER_ARN }}
+          TF_VAR_oidc_provider_url: ${{ secrets.OIDC_PROVIDER_URL }}
+
+      - name: Convert plan to JSON
+        working-directory: terraform/environments/${{ matrix.env }}
+        run: terraform show -json tfplan.binary > tfplan.json
+
+      - name: Install OPA
+        run: |
+          curl -L -o opa https://openpolicyagent.org/downloads/latest/opa_linux_amd64_static
+          chmod +x opa && sudo mv opa /usr/local/bin/
+
+      - name: Check IAM least-privilege
+        working-directory: terraform/environments/${{ matrix.env }}
+        run: |
+          VIOLATIONS=$(opa eval \
+            --input tfplan.json \
+            --data ../../opa/policies/iam-least-privilege.rego \
+            --format raw \
+            "data.terraform.iam.deny" \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d))")
+          if [[ "${VIOLATIONS}" -gt 0 ]]; then
+            echo "❌ IAM policy violations:"
+            opa eval --input tfplan.json --data ../../opa/policies/iam-least-privilege.rego \
+              --format raw "data.terraform.iam.deny" \
+              | python3 -c "import sys,json; [print('-', v) for v in json.load(sys.stdin)]"
+            exit 1
+          fi
+          echo "✅ IAM policies pass least-privilege check"
+
+  secret-rotation-audit:
+    name: Verify Rotation Enabled
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Check all prod secrets have rotation enabled
+        run: |
+          echo "Checking rotation status for prod secrets..."
+          NON_ROTATING=$(aws secretsmanager list-secrets \
+            --filter Key=tag-key,Values=Environment Key=tag-value,Values=prod \
+            --query "SecretList[?!RotationEnabled].Name" \
+            --output text)
+          if [[ -n "${NON_ROTATING}" ]]; then
+            echo "❌ Prod secrets WITHOUT rotation enabled:"
+            echo "${NON_ROTATING}"
+            exit 1
+          fi
+          echo "✅ All prod secrets have rotation enabled"
+
+      - name: Notify Slack on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {"text": "🚨 *Secrets audit FAILED* in prod — some secrets may not have rotation enabled. Check the workflow run for details."}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
